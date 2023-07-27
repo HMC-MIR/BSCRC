@@ -2,9 +2,13 @@
 
 Only pages in the 9-way dataset are labeled as filler and non-filler pages. In order to use all of IMSLP, we must therefore create a classifier to identify filler pages. The `notebook_01` uses our manually labeled 9-way filler pages to create a balanced dataset of filler and non-filler bootleg fragments of length 16. Then, `notebook_02` uses our pretrained LM model and finetunes a classifier to identify filler fragements. Follow directions below on how to run this classifier on all of IMSLP.
 
+## Creating the pretrained LM
+
+The pretrained Language Model that is located in the `filler` directory referenced in `notebook_02` is pretrained on all of IMSLP using the same Chinese character represention used in `notebook_01`. The details on how to train this model can be found in the root directory file `model_training_pipeline.ipynb`.
+
 ## Making Ensemble predictions on IMSLP
 
-Before running, ensure you clone the IMSLP bootleg score repo into `data_path`
+Before running, ensure you clone the IMSLP bootleg score repo into `data_path`. The current script assumes that `data_path` is a directory called `filler`.
 
 ```console
 git clone https://github.com/HMC-MIR/piano_bootleg_scores.git piano_bootleg_scores
