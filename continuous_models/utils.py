@@ -10,7 +10,7 @@ from pathlib import Path
 import math
 from torch import inf
 
-def create_dataset(file, add_pad=False):
+def create_dataset(file, add_pad=False, pretrain=False):
 
     pickle = pd.read_pickle(file)
 
@@ -21,14 +21,19 @@ def create_dataset(file, add_pad=False):
         X_train, y_train, X_val, y_val, X_test, y_test = pickle
         X_train, y_train, X_val, y_val, X_test, y_test = np.asarray(X_train), np.asarray(y_train), np.asarray(X_val), np.asarray(y_val), np.asarray(X_test), np.asarray(y_test)
 
-    # create mappings for labels to ids
-    label_encoder = LabelEncoder()
-    y_train = label_encoder.fit_transform(y_train)
-    y_val = label_encoder.transform(y_val)
-    y_test = label_encoder.transform(y_test)
-
-    label2id = dict(zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_)))
-    id2label = {v: k for k, v in label2id.items()}
+    if pretrain:
+        y_train = np.ones(len(y_train))
+        y_val = np.ones(len(y_val))
+        X_test = X_val
+        y_test = y_val
+    else:
+        # create mappings for labels to ids
+        label_encoder = LabelEncoder()
+        y_train = label_encoder.fit_transform(y_train)
+        y_val = label_encoder.transform(y_val)
+        y_test = label_encoder.transform(y_test)
+        label2id = dict(zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_)))
+        id2label = {v: k for k, v in label2id.items()}
 
     if add_pad:
         X_train = np.pad(X_train, ((0,0), (0,0), (1,1)), 'constant', constant_values=0)
@@ -50,6 +55,9 @@ def create_dataset(file, add_pad=False):
     train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
     val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
     test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
+
+    if pretrain:
+        return train_dataset, val_dataset, test_dataset
 
     return train_dataset, val_dataset, test_dataset, label2id, id2label
 
