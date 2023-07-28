@@ -34,34 +34,31 @@ def train(args):
     #               Create DataLoader                  #
     # ##################################################
 
-    train_dataset, val_dataset, _, _, _ = create_dataset(args.data_path)
+    train_dataset, val_dataset, test_dataset, _, _ = create_dataset(args.data_path, add_pad=True, pretrain=False)
     train_data_loader = torch.utils.data.DataLoader(train_dataset,
         batch_size=args.batch_size, num_workers=10, pin_memory=True, drop_last=True)
     val_data_loader = torch.utils.data.DataLoader(val_dataset,
+        batch_size=args.batch_size, num_workers=10, pin_memory=True, drop_last=False)
+    test_data_loader = torch.utils.data.DataLoader(test_dataset,
         batch_size=args.batch_size, num_workers=10, pin_memory=True, drop_last=False)
 
     # ##################################################
     #                 Define Model                     #
     # ##################################################
 
-    if args.probe:
-        model = VisionTransformer(
+    model = VisionTransformer(
             img_size=64, patch_size=8, in_chans=1, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
             qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), num_classes=args.nb_classes,
-            global_pool=args.global_pool)
-    else:
-        model = VisionTransformer(
-            img_size=64, patch_size=8, in_chans=1, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
-            qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path, global_pool=args.global_pool)
+            global_pool=args.global_pool
+        )
 
     # ##################################################
     #           Finetune Pretrained Model              #
     # ##################################################
 
-    if args.finetune:
-        print(f"Load pre-trained from: {args.finetune}")
-        checkpoint = torch.load(args.finetune, map_location='cpu')
+    if args.pretrain:
+        print(f"Load pre-trained from: {args.pretrain}")
+        checkpoint = torch.load(args.pretrain, map_location='cpu')
         checkpoint_model = checkpoint['model']
         state_dict = model.state_dict()
         # remove head.weight and head.bias keys from pretrained if exists and don't match shape
@@ -75,19 +72,17 @@ def train(args):
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
         else:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-        # manually initialize fc layer
-        if args.probe:
-            trunc_normal_(model.head.weight, std=0.01)
-        else:
-            trunc_normal_(model.head.weight, std=2e-5)
+        trunc_normal_(model.head.weight, std=0.01)
 
-    if args.probe:
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-        # freeze all but the head
-        for _, p in model.named_parameters():
-            p.requires_grad = False
-        for _, p in model.head.named_parameters():
+    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+    # freeze all but the head
+    for _, p in model.named_parameters():
+        if args.finetune:
             p.requires_grad = True
+        else:
+            p.requires_grad = False
+    for _, p in model.head.named_parameters():
+        p.requires_grad = True
 
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
@@ -103,19 +98,11 @@ def train(args):
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
-    if args.probe:
-        print("Training linear probe")
-        optimizer = LARS(model.module.head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        print("Finetuning model")
-        param_groups = param_groups_lrd(model.module, args.weight_decay,
-            no_weight_decay_list=model.module.no_weight_decay(), layer_decay=args.layer_decay)
-        optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-
+    optimizer = LARS(model.module.head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_scaler = NativeScaler()
     criterion = torch.nn.CrossEntropyLoss()
 
-    # load_model(args=args, model=model, optimizer=optimizer, loss_scaler=loss_scaler)
+    load_model(args=args, model=model, optimizer=optimizer, loss_scaler=loss_scaler)
 
     # ##################################################
     #                   Training                       #
@@ -138,6 +125,12 @@ def train(args):
             f.write(json.dumps(log_stats) + "\n")
 
     # ##################################################
+    #                Val/Test Accuracy                 #
+    # ##################################################
+
+    val_stats, test_stats = final_evaluate(val_data_loader, test_data_loader, model, args)
+
+    # ##################################################
     #                 Save Configs                     #
     # ##################################################
 
@@ -147,6 +140,10 @@ def train(args):
         f.write('Number of params (M): %.2f' % (n_parameters / 1.e6) + '\n\n')
         f.write(f'{args}'.replace(', ', '\n') + '\n\n')
         f.write(f'Training time: {total_time}\n\n')
+        f.write(f"Validation Accuracy Top 1: {val_stats['acc1']:.5f}%\n\n")
+        f.write(f"Validation Accuracy Top 5: {val_stats['acc5']:.5f}%\n\n")
+        f.write(f"Test Accuracy Top 1: {test_stats['acc1']:.5f}%\n\n")
+        f.write(f"Test Accuracy Top 5: {test_stats['acc5']:.5f}%\n\n")
 
 
 def train_one_epoch(model, criterion, data_loader, optimizer, epoch, loss_scaler, args):
@@ -216,30 +213,88 @@ def evaluate(data_loader, model):
         .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+@torch.no_grad()
+def final_evaluate(val_data_loader, test_data_loader, model, args):
+
+    model.eval()  # switch to evaluation mode
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    val_metric_logger = MetricLogger(delimiter="  ")
+    val_preds = []
+
+    for batch in val_metric_logger.log_every(val_data_loader, 10, 'Validation '):
+
+        images, target = batch[0], batch[-1]
+        images, target = images.to(device), target.to(device)
+
+        # with torch.cuda.amp.autocast():
+        output = model(images) # compute output
+        val_preds.append(output.cpu().numpy())
+
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        batch_size = images.shape[0]
+        val_metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        val_metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
+    print('* Acc@1 {top1.global_avg:.5f} Acc@5 {top5.global_avg:.5f}'
+        .format(top1=val_metric_logger.acc1, top5=val_metric_logger.acc5))
+
+    val_preds = np.concatenate(val_preds, axis=0)
+    with open(f"{args.output_dir}/val_preds.npy", "wb") as f:
+        np.save(f, val_preds)
+
+    test_metric_logger = MetricLogger(delimiter="  ")
+    test_preds = []
+
+    for batch in test_metric_logger.log_every(test_data_loader, 10, 'Test '):
+
+        images, target = batch[0], batch[-1]
+        images, target = images.to(device), target.to(device)
+
+        # with torch.cuda.amp.autocast():
+        output = model(images) # compute output
+        test_preds.append(output.cpu().numpy())
+
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        batch_size = images.shape[0]
+        test_metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        test_metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
+    print('* Acc@1 {top1.global_avg:.5f} Acc@5 {top5.global_avg:.5f}'
+        .format(top1=test_metric_logger.acc1, top5=test_metric_logger.acc5))
+
+    test_preds = np.concatenate(test_preds, axis=0)
+    with open(f"{args.output_dir}/test_preds.npy", "wb") as f:
+        np.save(f, test_preds)
+
+    return {k: meter.global_avg for k, meter in val_metric_logger.meters.items()}, {k: meter.global_avg for k, meter in test_metric_logger.meters.items()}
+
 
 def main():
 
     parser = ArgumentParser()
     parser.add_argument('--data_path', required=True, type=str, metavar='PATH', help='path to pkl file')
     parser.add_argument('--output_dir', type=str,  metavar='PATH', help='path where to save')
-    # parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--nb_classes', type=int, help='number of the classification types')
     parser.add_argument('--epochs', type=int, default=50, metavar='N', help='total epochs')
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N', help='epochs to warmup LR')
     parser.add_argument('--batch_size', default=64, type=int, metavar='N', help='samples per batch')
     parser.add_argument('--probe', action='store_true', help='fit linear probe')
     parser.set_defaults(probe=False)
+    parser.add_argument('--finetune', action='store_true', help='finetune linear probe')
+    parser.set_defaults(probe=False)
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
 
     # optimizer
     parser.add_argument('--weight_decay', type=float, default=0.05)
     parser.add_argument('--lr', type=float, default=None, metavar='LR', help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR', help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR', help='lower lr bound for cyclic schedulers that hit 0')
-    # parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM', help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--layer_decay', type=float, default=0.75, help='layer-wise lr decay from ELECTRA/BEiT')
 
     # finetune
-    parser.add_argument('--finetune', default='', help='finetune from checkpoint')
+    parser.add_argument('--pretrain', default='', help='finetune from checkpoint')
     parser.add_argument('--global_pool', action='store_true')
     parser.set_defaults(global_pool=False)
     parser.add_argument('--cls_token', action='store_false', dest='global_pool', help='Use class token instead of global pool for classification')

@@ -33,7 +33,7 @@ def train(args):
     #               Create DataLoader                  #
     # ##################################################
 
-    train_dataset, val_dataset, _, _, _ = create_dataset(args.data_path, pretrain=True)
+    train_dataset, val_dataset, _ = create_dataset(args.data_path, add_pad=True, pretrain=True)
     print(f"Loaded data of size {len(train_dataset)} and {len(val_dataset)}")
     train_data_loader = torch.utils.data.DataLoader(train_dataset,
         batch_size=args.batch_size, num_workers=10, pin_memory=True, drop_last=True)
