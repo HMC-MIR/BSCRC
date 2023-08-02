@@ -177,7 +177,6 @@ if __name__ == "__main__":
 
         model_path = model_base / d.stem
         print("Validation! :)")
-        run_validation_on_all_checkpoints(model_path, d)
+        test_and_eval_last_epoch(model_path, d)
         print("Testing! :)")
-        run_test_on_all_checkpoints(model_path, d)
 
