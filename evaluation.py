@@ -31,14 +31,15 @@ def tokenizer_function(examples, tokenizer):
 def label2id_function(examples, label2id):
     return {"label": [label2id[label] for label in examples["label"]]}
 
-def run_validation_on_all_checkpoints(classifier_path, data_path):
+def test_and_eval_last_epoch(classifier_path, data_path):
     pretrained_models = glob.glob(f"{classifier_path}/*/")
     pretrained_models = [model[:-1] for model in pretrained_models]
     pretrained_models.sort(key = lambda x: int(re.search('[0-9]+$', x).group(0)))
 
     # Prepare data
-    train_df, val_df, _ = data_preparation(data_path)
+    train_df, val_df, test_df= data_preparation(data_path)
     val_ds = Dataset.from_dict(val_df)
+    test_ds = Dataset.from_dict(test_df)
 
     config = AutoConfig.from_pretrained(pretrained_models[0])
 
@@ -54,98 +55,60 @@ def run_validation_on_all_checkpoints(classifier_path, data_path):
     # Tokenize and convert labels to ids
     val_ds = val_ds.map(tokenizer_function, batched=True, fn_kwargs={"tokenizer": tokenizer})
     val_ds = val_ds.map(label2id_function, batched=True, fn_kwargs={"label2id": label2id})
+    test_ds = test_ds.map(tokenizer_function, batched=True, fn_kwargs={"tokenizer": tokenizer})
+    test_ds = test_ds.map(label2id_function, batched=True, fn_kwargs={"label2id": label2id})
 
-    ds_list = [val_ds]
+    ds_list = [val_ds, test_ds]
     ds_list = [ds.remove_columns(["text"]) for ds in ds_list]
     ds_list = [ds.rename_column("label", "labels") for ds in ds_list]
     [ds.set_format("torch") for ds in ds_list]
 
     val_dl = torch.utils.data.DataLoader(ds_list[0], batch_size=BATCH_SIZE)
+    test_dl = torch.utils.data.DataLoader(ds_list[1], batch_size=BATCH_SIZE)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    progress_bar = tqdm(range(len(pretrained_models) * len(val_dl)))
-    accuracies = []
+    progress_bar = tqdm(range(len(val_dl) + len(test_dl)))
 
+    val_acc  = []
+    test_acc = []
     val_preds = []
-    for i, pretrained_model in enumerate(pretrained_models):
-
-        model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
-        model.to(device)
-        model.pad_token_id = tokenizer.pad_token_id
-
-        correct1, correct5, total = 0, 0, 0
-        model.eval()
-        for batch in val_dl:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                outputs = model(**batch)
-
-            logits = outputs.logits
-            if i == len(pretrained_models) - 1:
-                val_preds.append(logits.cpu().numpy())
-
-            _, top1 = torch.topk(logits, k=1, dim=1)
-            _, top5 = torch.topk(logits, k=5, dim=1)
-
-            total += batch['labels'].size(0)
-            correct1 += torch.sum(top1 == batch['labels'][:,None]).item()
-            correct5 += torch.sum(top5 == batch['labels'][:,None]).item()
-            progress_bar.update(1)
-
-        val_acc1 = correct1 / total
-        val_acc5 = correct5 / total
-        accuracies.append(f"{val_acc1},{val_acc5}\n")
-
-    val_preds = np.concatenate(val_preds, axis=0)
-    with open(f"{classifier_path}/val_preds.npy", "wb") as f:
-        np.save(f, val_preds)
-    
-    with open(f"{classifier_path}/val_acc.csv", "w") as f:
-        for accuracy in accuracies:
-            f.write(accuracy)
-
-
-def run_test_on_all_checkpoints(classifier_path, data_path):
-    pretrained_models = glob.glob(f"{classifier_path}/*/")
-    pretrained_models = [model[:-1] for model in pretrained_models]
-    pretrained_models.sort(key = lambda x: int(re.search('[0-9]+$', x).group(0)))
-
-    # Prepare data
-    train_df, _, test_df= data_preparation(data_path)
-    test_ds = Dataset.from_dict(test_df)
-
-    config = AutoConfig.from_pretrained(pretrained_models[0])
-
-    # Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_models[0])
-    tokenizer.pad_token = '<pad>'
-    tokenizer.model_max_length = config.n_positions
-    config.pad_token_id = tokenizer.pad_token_id
-
-    # Define label map
-    label2id = {label: i for i, label in enumerate(set(train_df['label']))}
-
-    # Tokenize and convert labels to ids
-    test_ds = test_ds.map(tokenizer_function, batched=True, fn_kwargs={"tokenizer": tokenizer})
-    test_ds = test_ds.map(label2id_function, batched=True, fn_kwargs={"label2id": label2id})
-
-    ds_list = [test_ds]
-    ds_list = [ds.remove_columns(["text"]) for ds in ds_list]
-    ds_list = [ds.rename_column("label", "labels") for ds in ds_list]
-    [ds.set_format("torch") for ds in ds_list]
-
-    test_dl = torch.utils.data.DataLoader(ds_list[0], batch_size=BATCH_SIZE)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    progress_bar = tqdm(range(len(test_dl)))
-    accuracies = []
-
     test_preds = []
 
     pretrained_model = pretrained_models[-1] # use last epoch
     model = AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
     model.to(device)
     model.pad_token_id = tokenizer.pad_token_id
+
+    correct1, correct5, total = 0, 0, 0
+    model.eval()
+    for batch in val_dl:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        logits = outputs.logits
+        val_preds.append(logits.cpu().numpy())
+
+        _, top1 = torch.topk(logits, k=1, dim=1)
+        _, top5 = torch.topk(logits, k=5, dim=1)
+
+        total += batch['labels'].size(0)
+        correct1 += torch.sum(top1 == batch['labels'][:,None]).item()
+        correct5 += torch.sum(top5 == batch['labels'][:,None]).item()
+        progress_bar.update(1)
+
+    val_acc1 = correct1 / total
+    val_acc5 = correct5 / total
+    val_acc.append(f"{val_acc1},{val_acc5}\n")
+
+    val_preds = np.concatenate(val_preds, axis=0)
+    with open(f"{classifier_path}/val_preds.npy", "wb") as f:
+        np.save(f, val_preds)
+    
+    with open(f"{classifier_path}/val_acc.csv", "w") as f:
+        for accuracy in val_acc:
+            f.write(accuracy)
+
 
     correct1, correct5, total = 0, 0, 0
     model.eval()
@@ -167,14 +130,14 @@ def run_test_on_all_checkpoints(classifier_path, data_path):
 
     val_acc1 = correct1 / total
     val_acc5 = correct5 / total
-    accuracies.append(f"{val_acc1},{val_acc5}\n")
+    test_acc.append(f"{val_acc1},{val_acc5}\n")
 
     test_preds = np.concatenate(test_preds, axis=0)
     with open(f"{classifier_path}/test_preds.npy", "wb") as f:
         np.save(f, test_preds)
     
     with open(f"{classifier_path}/test_acc.csv", "w") as f:
-        for accuracy in accuracies:
+        for accuracy in test_acc:
             f.write(accuracy)
 
 
@@ -214,7 +177,6 @@ if __name__ == "__main__":
 
         model_path = model_base / d.stem
         print("Validation! :)")
-        run_validation_on_all_checkpoints(model_path, d)
+        test_and_eval_last_epoch(model_path, d)
         print("Testing! :)")
-        run_test_on_all_checkpoints(model_path, d)
 

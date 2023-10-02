@@ -1,6 +1,4 @@
-import sys
-sys.path.append('../../source')
-from utils import merge_staff_overlaps
+from utils.utils import merge_staff_overlaps
 import numpy as np
 
 # DEFINE THE ENCODERS TO USE FOR SPARSE ENCODINGS
